@@ -19,6 +19,7 @@ import matplotlib.animation as animation
 import configparser
 import os
 import logging
+import collections
 import pkg_resources
 import datetime
 from threading import Thread
@@ -32,6 +33,23 @@ DEFAULT_PLOT_SAMPLES = 2000
 VOLTAGE_REFERENCE = 2.5
 VOLT_MAX = 12
 VOLT_MIN = -12
+CFG_DEFAULTS = {
+    "; Allowed rate values [ 0 - 22 ]": None,
+    "; Fastest rate is 0": None,
+    "rate": 0,
+    "; Allowed settle_delay values [ 0 - 7 ]": None,
+    "settle_delay": 0,
+    "; Allowed enhanced_filter values: [ 2, 3, 5, 6 ]": None,
+    "enhanced_filter": 0,
+    "; Allowed use_sinc3 choices: [ True | False ]": None,
+    "use_sinc3": False,
+    "; Allowed magnetometer enable bitmask: [ 0x0000 - 0xFFFF ]": None,
+    "; 0x8000 is Mag 16, 0x0001 is Mag 1, 0x0002 is Mag 2 etc": None,
+    "use_magnetometer": 0xFFFF
+}
+
+
+
 def raw_to_voltage(val):
     # When the ADC is configured for bipolar operation, the output           
     # code is offset binary with a negative full-scale voltage resulting    
@@ -42,6 +60,28 @@ def raw_to_voltage(val):
     # Code = 2^(N – 1) × ((VIN × 0.1)/VREF) + 1)                    
     # N = 24, Vin = input voltage, Vref = reference voltage (internal 2.5V) 
     return (((val / 8388608) - 1) * VOLTAGE_REFERENCE) / 0.1
+
+def write_msg(socket, addr, data):
+    msg = struct.pack("<III", ord("w"), addr, data)
+    socket.send(msg, 0)
+    resp = socket.recv()
+    msg = struct.unpack_from("<I", resp, 0)
+    if msg[0] == 114:
+        msg = struct.unpack_from("<I", resp, 4)
+        return msg[0]
+    else:
+        raise ("Write Error")
+
+
+def read_msg(socket, bus, addr):
+    msg = struct.pack("<III", ord(bus), addr, 0)
+    socket.send(msg, 0)
+    resp = socket.recv()
+    msg = struct.unpack_from("<I", resp, 0)
+    if msg[0] == 114:
+        return struct.unpack_from("<I", resp, 4)[0]
+    else:
+        raise ValueError("Read Error")
 
 
 class FluxGate(midas.frontend.EquipmentBase):
@@ -75,9 +115,26 @@ class FluxGate(midas.frontend.EquipmentBase):
         default_common.read_when = midas.RO_ALWAYS
         default_common.log_history = 5
         
+        # Settings
+        default_settings = collections.OrderedDict([  
+            ("host_ip", "142.90.151.5"),
+            ("rate", 0),
+            ("settle_delay",0),
+            ("enhanced_filter", 0),
+            ("use_sinc3", False),
+            ("use_magnetometer", 0xffff)
+        ])    
+
+
         # You MUST call midas.frontend.EquipmentBase.__init__ in your equipment's __init__ method!
-        midas.frontend.EquipmentBase.__init__(self, client, equip_name, default_common)
+        midas.frontend.EquipmentBase.__init__(self, client, equip_name, default_common,default_settings)
         
+        # Get IP address
+        self.host_ip = self.client.odb_get(self.odb_settings_dir + "/host_ip")
+
+        # Setup callback on port enable ODB keys
+        self.client.odb_watch(self.odb_settings_dir, self.settings_callback)
+
         global number_packets
         number_packets = 0
 
@@ -93,6 +150,31 @@ class FluxGate(midas.frontend.EquipmentBase):
         or None (if we shouldn't write an event).
         """
         
+        # Get the current configuration
+        cfg = configparser.ConfigParser(CFG_DEFAULTS, allow_no_value=True)
+        cfg.default_section = "default"
+        context = zmq.Context()
+        server = "tcp://"+self.host_ip+":5556"
+        socket = context.socket(zmq.REQ)
+        socket.connect(server)
+
+        enhfilter = read_msg(socket, "r", 2)  # enhanced_filter
+        rate = read_msg(socket, "r", 3)  # rate
+        delay = read_msg(socket, "r", 4)  # delay
+        mag_mask = read_msg(socket, "r", 5)  # Magnetometer bitmask
+        
+        if(rate & 0x80000000):
+            use_sinc3 = True
+        else:
+            use_sinc3 = False
+
+        mag_mask = mag_mask & 0xFFFF
+        rate = rate & 0x7FFFFFFF
+
+        print("Rate : " + str(rate) + "  mask: " + str(mag_mask) + "  enhfilter: " + str(enhfilter))
+
+        # get a sample flux gate value
+
         event = midas.event.Event()
         
         voltage_updated = False
@@ -116,6 +198,60 @@ class FluxGate(midas.frontend.EquipmentBase):
         
         
         return event
+
+
+    def settings_callback(self,client, path, odb_value):
+        """
+        Callback function when setting tree is change
+        """
+        print("New ODB content at %s is %s" % (path, odb_value))
+        
+        #print(str(odb_value['host_ip']))
+        context = zmq.Context()
+        server = "tcp://" +self.host_ip + ":5556"
+        socket = context.socket(zmq.REQ)
+        socket.connect(server)
+
+        rate = odb_value['rate']
+        delay = odb_value['settle_delay']
+        enhanced_filter = odb_value['enhanced_filter']
+        use_sinc3 = odb_value['use_sinc3']
+        mag_mask = odb_value['use_magnetometer'] & 0xFFFF
+        
+
+        # do checks to make sure values are sensible
+        if rate > 22 or rate < 0:
+            self.client.msg("Invalid value for rate="+str(rate)+"; must be between 0-22.",True)
+            rate = 0;
+        if delay > 7 or delay < 0:
+            self.client.msg("Invalid value for settle_delay="+str(delay)+"; must be between 0-7.",True)
+            rate = 0;
+
+        filter_list = [0,2,3,5,6]
+        if  not enhanced_filter in filter_list:
+            self.client.msg("Invalid value for enhanced_list="+str(enhanced_filter)+".  Must be in list="+str(filter_list),True)
+          
+            enhanced_filter = 0
+
+        self.client.msg("New flux_gate settings: rate="+str(rate)+" settle_delay="+str(delay)+"; enhanced_filter="+str(enhanced_filter)+"mag_mask="+str(mag_mask))
+            
+
+        if enhanced_filter != 0:
+            use_sinc3 = False
+            rate = rate & 0x7FFFFFFF
+            
+        if use_sinc3:
+            rate = rate | 0x80000000
+
+      
+
+        write_msg(socket, 2, enhanced_filter)
+        write_msg(socket, 3, rate)
+        write_msg(socket, 4, delay)
+        write_msg(socket, 5, mag_mask)
+        # toggle adc_soft_reset to start SPI load of values
+        write_msg(socket, 0, 1)
+        write_msg(socket, 0, 0)
 
 
 
@@ -309,6 +445,8 @@ class MyFrontend(midas.frontend.FrontendBase):
         
         self.add_equipment(FluxGateData(self.client))
         self.add_equipment(FluxGate(self.client))
+
+        self.client.msg("Fluxgate frontend initialized.")
         
     def begin_of_run(self, run_number):
         """
@@ -331,7 +469,7 @@ class MyFrontend(midas.frontend.FrontendBase):
         Most people won't need to define this function, but you can use
         it for final cleanup if needed.
         """
-        print("Goodbye from user code!")
+        self.client.msg("Fluxgate frontend stopped.")
         
 if __name__ == "__main__":
     # The main executable is very simple - just create the frontend object,
