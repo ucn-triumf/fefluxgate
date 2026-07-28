@@ -31,7 +31,7 @@ class FluxgateBox(object):
         socket.setsockopt_string(zmq.SUBSCRIBE, "")
         socket.connect(server)
         self.socket_sub = socket
-        print("failed" if context.closed else "success")
+        print("done")
 
         # socket for request 
         self.socket_req = context.socket(zmq.REQ)

@@ -78,11 +78,10 @@ class FluxGate(midas.frontend.EquipmentBase):
         event = midas.event.Event()    
     
         data = np.zeros(16*3, dtype=float)
-        idx = 0
         for i in range(16):
-            for j in range(3):
-                data[idx] = self.fluxbox.data[i][j+3]
-                idx += 1
+            # get_volts returns [x, y, z] in volts, or NaNs if this
+            # magnetometer has not reported yet (e.g. disabled by bitmask).
+            data[i*3:(i+1)*3] = self.fluxbox.get_volts(i)
 
         event.create_bank("FG00", midas.TID_FLOAT, data)
 
@@ -107,14 +106,17 @@ class FluxGate(midas.frontend.EquipmentBase):
         if rate > 22 or rate < 0:
             self.client.msg(f"Invalid value for rate={rate}; must be between 0-22.", True)
             rate = 0;
+            self.settings['rate'] = rate  # reset the invalid value shown in the ODB
         if delay > 7 or delay < 0:
             self.client.msg(f"Invalid value for settle_delay={delay}; must be between 0-7.",True)
             delay = 0;
+            self.settings['settle_delay'] = delay  # reset the invalid value shown in the ODB
 
         filter_list = [0,2,3,5,6]
         if  not enhanced_filter in filter_list:
             self.client.msg(f"Invalid value for enhanced_list={enhanced_filter}.  Must be in list={filter_list}",True)
             enhanced_filter = 0
+            self.settings['enhanced_filter'] = enhanced_filter  # reset the invalid value shown in the ODB
 
         self.client.msg(f"New FluxGate settings: rate={rate} settle_delay={delay}; enhanced_filter={enhanced_filter} mag_mask={mag_mask}")
             
