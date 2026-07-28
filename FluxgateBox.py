@@ -6,7 +6,7 @@ import zmq
 import struct
 import numpy as np
 import threading
-import time
+import time # for debugging
 
 VOLTAGE_REFERENCE = 2.5
 
